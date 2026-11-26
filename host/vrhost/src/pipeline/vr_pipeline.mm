@@ -91,6 +91,50 @@ VrPipeline::~VrPipeline()
 	server.reset(); // joins the link thread before the bridge goes away
 }
 
+// OpenXR grip pose -> SteamVR "raw" pose of an Oculus Touch controller. OpenVR titles bind /user/hand/*/pose/raw
+// (VRChat's bindings_oculus_touch.json does); handing them the OpenXR grip pose puts the hands ~10 cm and ~20 deg off,
+// and the avatar's IK bends the elbow to make up for it. Offset from xrizer (src/input/profiles/oculus_touch.rs,
+// offset_grip_pose: the inverse of the controller's "openxr_grip" in SteamVR's render model): raw = grip * inverse(
+// T(+-0.007, -0.00182941, 0.1019482) * Rx(20.6 deg)), applied like xrizer's raw space (grip action space with that pose).
+static std::array<float, 4> qmul(const std::array<float, 4> & a, const std::array<float, 4> & b)
+{
+	return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1], a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+	        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3], a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+
+static std::array<float, 3> cross(const std::array<float, 3> & a, const std::array<float, 3> & b)
+{
+	return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+
+static std::array<float, 3> qrot(const std::array<float, 4> & q, const std::array<float, 3> & v)
+{
+	std::array<float, 3> u{q[0], q[1], q[2]}, t = cross(u, v);
+	for (auto & x: t)
+		x *= 2;
+	auto c = cross(u, t);
+	return {v[0] + q[3] * t[0] + c[0], v[1] + q[3] * t[1] + c[1], v[2] + q[3] * t[2] + c[2]};
+}
+
+static std::optional<TrackedPose> touch_grip_to_raw(std::optional<TrackedPose> t, int hand)
+{
+	if (not t)
+		return t;
+	const float half = 20.6f * float(M_PI) / 180.f / 2.f;
+	const std::array<float, 4> q_off{-std::sin(half), 0, 0, std::cos(half)}; // inverse of Rx(20.6 deg)
+	const std::array<float, 3> t_grip{hand ? -0.007f : 0.007f, -0.00182941f, 0.1019482f};
+	auto r = qrot(q_off, t_grip);
+	const std::array<float, 3> t_off{-r[0], -r[1], -r[2]};
+	auto d = qrot(t->pose.orientation, t_off); // offset in the tracking space
+	for (int i = 0; i < 3; i++)
+		t->pose.position[i] += d[i];
+	t->pose.orientation = qmul(t->pose.orientation, q_off);
+	auto w = cross(t->angular_velocity, d); // the raw point moves with the controller's rotation too
+	for (int i = 0; i < 3; i++)
+		t->linear_velocity[i] += w[i];
+	return t;
+}
+
 static vrl_pose to_vrl(const std::optional<TrackedPose> & t)
 {
 	vrl_pose p{};
@@ -270,7 +314,12 @@ void VrPipeline::frame_clock()
 		ps.h = {VRL_POSES, sizeof ps};
 		ps.time = t.predicted_display;
 		for (int d = 0; d < VRL_DEV_COUNT; d++)
-			ps.pose[d] = to_vrl(session.pose_at(Device(d), t.predicted_display));
+		{
+			auto pose = session.pose_at(Device(d), t.predicted_display);
+			if (Device(d) == Device::left_grip or Device(d) == Device::right_grip)
+				pose = touch_grip_to_raw(pose, Device(d) == Device::right_grip);
+			ps.pose[d] = to_vrl(pose);
+		}
 		// poses first: the guest's frame starts on the timing packet
 		server->send(&ps, sizeof ps);
 		if (server->send(&tm, sizeof tm))
