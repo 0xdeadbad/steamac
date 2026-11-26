@@ -16,6 +16,7 @@ void *render_models_iface();
 void *overlay_iface();
 void *screenshots_iface();
 void *overlay_view_iface();
+void *mailbox_iface();  // IVRMailbox_001 (undocumented, Source 2 games need it), misc.cpp
 
 // device description used by IVRSystem properties and IVRInput origins
 struct ControllerInfo {

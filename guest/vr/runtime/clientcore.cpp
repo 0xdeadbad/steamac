@@ -45,6 +45,7 @@ const IfaceEntry kIfaces[] = {
     {vr::IVROverlay_Version, overlay_iface},
     {vr::IVRScreenshots_Version, screenshots_iface},
     {vr::IVROverlayView_Version, overlay_view_iface},
+    {"IVRMailbox_001", mailbox_iface},
 };
 
 class ClientCore : public IVRClientCore {

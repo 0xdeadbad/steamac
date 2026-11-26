@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <string>
 
@@ -166,5 +167,45 @@ void *screenshots_iface() {
 void *overlay_view_iface() {
   static OverlayView o;
   return static_cast<vr::IVROverlayView *>(&o);
+}
+
+// IVRMailbox_001: SteamVR's undocumented message channel between an app and the SteamVR dashboard/monitor. Source 2
+// games (Half-Life: Alyx) refuse to start when GetGenericInterface has no such interface ("VrMailbox failed
+// initialization"). Layout from Proton's vrclient_x64 (openvr_v1.10.30/openvr.h, undoc1..undoc4): register a
+// mailbox by name, unregister it, send a message to a named mailbox, read the next message. There is no SteamVR
+// here to talk to, so registering hands out handles, sending succeeds and nothing ever arrives.
+namespace {
+using vrmb_handle = uint64_t;
+// values as in OpenVR's ivrmailbox.h
+enum vrmb_result : int { vrmb_ok = 0, vrmb_failed = 1, vrmb_invalid_handle = 2, vrmb_registration_failed = 3, vrmb_no_message = 4, vrmb_message_too_big = 5 };
+class IVRMailbox_001 {
+ public:
+  virtual vrmb_result RegisterMailbox(const char *name, vrmb_handle *handle) = 0;
+  virtual vrmb_result UndoRegisterMailbox(vrmb_handle handle) = 0;
+  virtual vrmb_result SendMessage(vrmb_handle handle, const char *to, const char *message) = 0;
+  virtual vrmb_result ReadMessage(vrmb_handle handle, char *buffer, uint32_t size, uint32_t *written) = 0;
+};
+class Mailbox : public IVRMailbox_001 {
+ public:
+  vrmb_result RegisterMailbox(const char *name, vrmb_handle *handle) override {
+    SVR_INFO("mailbox: register %s", name ? name : "(null)");
+    if (handle) *handle = next_.fetch_add(1);
+    return vrmb_ok;
+  }
+  vrmb_result UndoRegisterMailbox(vrmb_handle) override { return vrmb_ok; }
+  vrmb_result SendMessage(vrmb_handle, const char *, const char *) override { return vrmb_ok; }
+  vrmb_result ReadMessage(vrmb_handle, char *buffer, uint32_t size, uint32_t *written) override {
+    if (buffer && size) buffer[0] = 0;
+    if (written) *written = 0;
+    return vrmb_no_message;  // nothing is ever sent to the game (vrmb_ok with no text fails its JSON parse)
+  }
+
+ private:
+  std::atomic<vrmb_handle> next_{1};
+};
+}  // namespace
+void *mailbox_iface() {
+  static Mailbox m;
+  return static_cast<IVRMailbox_001 *>(&m);
 }
 }  // namespace svr
