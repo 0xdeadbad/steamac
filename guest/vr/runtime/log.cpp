@@ -6,12 +6,15 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unistd.h>
 
 namespace svr {
 static int log_level() {
   static int level = [] {
     const char *s = getenv("STEAMAC_VR_LOG");
-    return s && *s ? atoi(s) : 0;
+    if (s && *s) return atoi(s);
+    // under Obelisk (see transport.cpp) no variable reaches the game: log the interface requests by default there
+    return access("/run/obelisk/vr.sock", F_OK) == 0 ? 2 : 0;
   }();
   return level;
 }

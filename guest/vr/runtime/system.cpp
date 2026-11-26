@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // IVRSystem: headset geometry, tracked devices and their properties, events, legacy controller state.
+#include <dlfcn.h>
 #include <string.h>
 
 #include <cmath>
@@ -12,6 +13,36 @@
 
 namespace svr {
 namespace {
+// The VkPhysicalDevice the headset is "on", for a native Vulkan game (Source 2 picks its GPU with it): the
+// instance's first hardware GPU (Venus in the VM), else its first device. Uses the game's own Vulkan loader.
+uint64_t vulkan_output_device(VkInstance_T *instance) {
+  typedef void (*PFN)(void);
+  typedef PFN (*GetInstanceProcAddr)(VkInstance_T *, const char *);
+  typedef int32_t (*EnumeratePhysicalDevices)(VkInstance_T *, uint32_t *, void **);
+  typedef void (*GetPhysicalDeviceProperties)(void *, void *);
+  void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_NOLOAD);
+  if (!lib) lib = dlopen("libvulkan.so.1", RTLD_NOW);
+  auto gipa = lib ? (GetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr") : nullptr;
+  if (!instance || !gipa) return 0;
+  auto enumerate = (EnumeratePhysicalDevices)gipa(instance, "vkEnumeratePhysicalDevices");
+  auto props = (GetPhysicalDeviceProperties)gipa(instance, "vkGetPhysicalDeviceProperties");
+  void *devs[16];
+  uint32_t n = 16;
+  if (!enumerate || enumerate(instance, &n, devs) < 0 || !n) return 0;
+  // VkPhysicalDeviceProperties: apiVersion, driverVersion, vendorID, deviceID, deviceType, deviceName[256], ...
+  alignas(8) unsigned char p[1024];
+  for (uint32_t i = 0; props && i < n; i++) {
+    props(devs[i], p);
+    uint32_t type;
+    memcpy(&type, p + 16, 4);
+    if (type == 1 || type == 2) {  // integrated or discrete GPU (not CPU/llvmpipe)
+      SVR_INFO("output device: %s", (const char *)p + 20);
+      return (uint64_t)devs[i];
+    }
+  }
+  return (uint64_t)devs[0];
+}
+
 uint32_t copy_string(const std::string &s, char *buf, uint32_t size, vr::ETrackedPropertyError *err) {
   uint32_t need = (uint32_t)s.size() + 1;
   if (buf && size >= need) {
@@ -77,8 +108,8 @@ class System : public StubIVRSystem {
   void GetDXGIOutputInfo(int32_t *adapter) override {
     if (adapter) *adapter = 0;  // Proton maps this to the adapter the game already uses
   }
-  void GetOutputDevice(uint64_t *dev, ETextureType, VkInstance_T *) override {
-    if (dev) *dev = 0;
+  void GetOutputDevice(uint64_t *dev, ETextureType type, VkInstance_T *instance) override {
+    if (dev) *dev = type == TextureType_Vulkan ? vulkan_output_device(instance) : 0;
   }
   bool IsDisplayOnDesktop() override { return false; }
   bool SetDisplayVisibility(bool) override { return false; }

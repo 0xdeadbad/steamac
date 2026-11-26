@@ -15,15 +15,47 @@
 #include <string>
 
 #include "log.h"
+#include "vulkan_bridge.h"
+
+// obelisk-vrbridge's socket, as an Obelisk game sees it (a macro: it is also pasted into "stream:" ...)
+#define kObeliskSocket "/run/obelisk/vr.sock"
 
 namespace svr {
 namespace {
+// all of `len` bytes, or -errno (0 bytes read = the peer closed: -EPIPE)
+static int send_all(int fd, const void *p, size_t len) {
+  for (size_t done = 0; done < len;) {
+    ssize_t n = send(fd, (const char *)p + done, len - done, MSG_NOSIGNAL);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return n < 0 ? -errno : -EPIPE;
+    done += (size_t)n;
+  }
+  return 0;
+}
+static int recv_all(int fd, void *p, size_t len) {
+  for (size_t done = 0; done < len;) {
+    ssize_t n = recv(fd, (char *)p + done, len - done, 0);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return n < 0 ? -errno : -EPIPE;
+    done += (size_t)n;
+  }
+  return 0;
+}
+
 class SocketTransport : public Transport {
  public:
-  explicit SocketTransport(int fd) : fd_(fd) {}
+  // stream: SOCK_STREAM, a message is its svr_hdr and then the rest of hdr.size bytes (hosts without
+  // SOCK_SEQPACKET Unix sockets: macOS, and Linux programs run on it by an emulator such as voile-lkd)
+  SocketTransport(int fd, bool stream) : fd_(fd), stream_(stream) {}
   ~SocketTransport() override { close(fd_); }
   int call(const svr_hdr *req, svr_hdr *rep, uint32_t rep_cap) override {
     std::lock_guard<std::mutex> g(m_);
+    if (stream_) {
+      if (int r = send_all(fd_, req, req->size)) return r;
+      if (int r = recv_all(fd_, rep, sizeof(svr_hdr))) return r;
+      if (rep->size < sizeof(svr_hdr) || rep->size > rep_cap) return -EPROTO;
+      return recv_all(fd_, (char *)rep + sizeof(svr_hdr), rep->size - sizeof(svr_hdr));
+    }
     if (send(fd_, req, req->size, MSG_NOSIGNAL) != (ssize_t)req->size) return -errno;
     ssize_t n = recv(fd_, rep, rep_cap, 0);
     if (n < (ssize_t)sizeof(svr_hdr)) return n < 0 ? -errno : -EPROTO;
@@ -38,10 +70,60 @@ class SocketTransport : public Transport {
     int r = call(&req.h, &ack.h, sizeof(ack));
     return r ? r : ack.status;
   }
+  int submit_npt(const svr_wmtvr_submit &info, const svr_npt_eye npt_in[2]) override {
+    if (!stream_) return -EOPNOTSUPP;
+    svr_npt_submit_req req{};
+    req.h = {SVR_NPT_SUBMIT, sizeof(req)};
+    req.info = info;
+    int fds[3], nfds = 0;
+    for (int e = 0; e < 2; e++) {
+      req.npt[e] = npt_in[e];
+      int fd = SVR_NPT_HANDLE_FD(info.eye[e].texture);
+      int slot = -1;
+      for (int i = 0; i < nfds; i++)
+        if (fds[i] == fd) slot = i;
+      if (slot < 0) fds[slot = nfds++] = fd;
+      req.npt[e].fd_slot = (uint32_t)slot;
+      req.npt[e].game_fd = (uint64_t)fd;
+    }
+    // the copy's fence: ours to hand over (Neptune armed it for this frame only), closed once sent
+    int fence = SVR_NPT_IS_FENCE(info.wait_event) ? SVR_NPT_HANDLE_FD(info.wait_event) : -1;
+    req.fence_slot = SVR_NPT_NO_SLOT;
+    if (fence >= 0) {
+      req.fence_slot = (uint32_t)nfds;
+      fds[nfds++] = fence;
+    }
+    req.info.wait_event = 0, req.info.wait_value = 0;
+    struct CloseFence {
+      int fd;
+      ~CloseFence() { if (fd >= 0) close(fd); }
+    } close_fence{fence};
+    alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int) * 3)] = {};
+    iovec iov{&req, sizeof(req)};
+    msghdr m{};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = ctl;
+    m.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
+    cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+    memcpy(CMSG_DATA(c), fds, sizeof(int) * nfds);
+    std::lock_guard<std::mutex> g(m_);
+    ssize_t n;
+    do n = sendmsg(fd_, &m, MSG_NOSIGNAL); while (n < 0 && errno == EINTR);
+    if (n < 0) return -errno;
+    if ((size_t)n < sizeof(req) && send_all(fd_, (char *)&req + n, sizeof(req) - (size_t)n)) return -EPIPE;
+    svr_ack ack{};
+    if (int r = recv_all(fd_, &ack, sizeof(ack))) return r;
+    return ack.status;
+  }
   const char *name() const override { return "socket"; }
 
  private:
   int fd_;
+  bool stream_;
   std::mutex m_;
 };
 
@@ -95,9 +177,15 @@ int find_unixlib_dir(struct dl_phdr_info *info, size_t, void *out) {
 }
 }  // namespace
 
+// STEAMAC_VR_SOCKET=<path> (SOCK_SEQPACKET) or stream:<path> (SOCK_STREAM, see SocketTransport)
 std::unique_ptr<Transport> Transport::open_socket(const char *path) {
-  int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-  if (fd < 0) return nullptr;
+  bool stream = !strncmp(path, "stream:", 7);
+  if (stream) path += 7;
+  int fd = socket(AF_UNIX, (stream ? SOCK_STREAM : SOCK_SEQPACKET) | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    SVR_ERR("socket for %s: %s", path, strerror(errno));
+    return nullptr;
+  }
   sockaddr_un a{};
   a.sun_family = AF_UNIX;
   strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
@@ -106,7 +194,8 @@ std::unique_ptr<Transport> Transport::open_socket(const char *path) {
     close(fd);
     return nullptr;
   }
-  return std::unique_ptr<Transport>(new SocketTransport(fd));
+  SVR_INFO("host link: %s socket %s", stream ? "stream" : "seqpacket", path);
+  return std::unique_ptr<Transport>(new SocketTransport(fd, stream));
 }
 
 std::unique_ptr<Transport> Transport::open_wmtr() {
@@ -118,6 +207,13 @@ std::unique_ptr<Transport> Transport::open_wmtr() {
     // renders): load Wine's winemetal.so ourselves for its own wmtr context. Only reached on VR init.
     path.clear();
     dl_iterate_phdr(find_unixlib_dir, &path);
+    if (path.empty()) {
+      // a native Linux game (no Wine in the process): the wmtr client built for this arch, kept next to us
+      Dl_info self{};
+      if (!dladdr((void *)&find_unixlib_dir, &self) || !self.dli_fname) return nullptr;
+      path = self.dli_fname;
+      path.erase(path.rfind('/') + 1);
+    }
     if (path.empty() || path.back() != '/') return nullptr;
     path += "winemetal.so";
     if (!(h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL))) {
@@ -131,11 +227,15 @@ std::unique_ptr<Transport> Transport::open_wmtr() {
     SVR_ERR("%s has no wmtr_vr_call (wmtr client too old)", path.c_str());
     return nullptr;
   }
+  vulkan_bridge_init((wmtr_unix_call *)table);
   return std::unique_ptr<Transport>(new WmtrTransport(fn, (unix_call_fn)table[SVR_WMTVR_SUBMIT_CALL]));
 }
 
 std::unique_ptr<Transport> Transport::open_default() {
   if (const char *s = getenv("STEAMAC_VR_SOCKET"); s && *s) return open_socket(s);
+  // Obelisk's Linux engine (voile-lkd): its launcher passes the game no variables of ours, but obelisk-vrbridge puts
+  // its socket in the session folder every game sees as /run/obelisk
+  if (access(kObeliskSocket, F_OK) == 0) return open_socket("stream:" kObeliskSocket);
   return open_wmtr();
 }
 }  // namespace svr

@@ -24,6 +24,7 @@ enum svr_op {
   SVR_FRAME = 2,  /* svr_frame_req   -> svr_frame_rep: timing + poses + input snapshot */
   SVR_SUBMIT = 3, /* svr_submit_req  -> svr_ack: both eyes of one frame */
   SVR_HAPTIC = 4, /* svr_haptic_req  -> svr_ack */
+  SVR_NPT_SUBMIT = 5, /* svr_npt_submit_req (+ SCM_RIGHTS fds, stream socket) -> svr_ack: Neptune eye images */
 };
 
 struct svr_hdr {
@@ -178,6 +179,36 @@ struct svr_metal_texture {
   uint32_t dxgi_format; /* DXGI_FORMAT of the D3D11 texture */
   uint32_t array_size, sample_count;
   uint32_t array_index; /* slice for this eye (SubmitWithArrayIndex; else the eye for an array texture, 0 otherwise) */
+};
+
+/* Neptune (Obelisk's Linux engine) eye images: its IMTLD3D11ExportableTexture (npt_vr_export.c in Zagrios/neptune,
+ * local change) returns handle = SVR_NPT_HANDLE_MAGIC << 56 | pitch << 24 | fd: a linear image, every array slice
+ * of the eye texture stacked vertically, whose memory any macOS process can map from the fd. The runtime sends
+ * those frames as SVR_NPT_SUBMIT with the fds attached (SCM_RIGHTS, in eye order, one per distinct fd). */
+#define SVR_NPT_HANDLE_MAGIC 0xA5u
+#define SVR_NPT_IS_HANDLE(h) ((uint32_t)((uint64_t)(h) >> 56) == SVR_NPT_HANDLE_MAGIC)
+#define SVR_NPT_HANDLE_FD(h) ((int)((uint64_t)(h) & 0xffffffu))
+#define SVR_NPT_HANDLE_PITCH(h) ((uint32_t)(((uint64_t)(h) >> 24) & 0xffffffu))
+struct svr_npt_eye {
+  uint32_t width, height; /* one slice */
+  uint32_t dxgi_format;   /* the eye texture's (the image holds its UNORM base) */
+  uint32_t slices;        /* stacked slices: the image is width x (height * slices) */
+  uint32_t pitch;         /* bytes per row of the image */
+  uint32_t fd_slot;       /* which attached fd */
+  uint64_t game_fd;       /* the fd's number in the game process: a stable name for the image */
+};
+/* info.wait_event = SVR_NPT_FENCE_MAGIC << 56 | fd: a sync fd that becomes readable once the GPU finished the copy
+ * into the eye images (Neptune's swapchain fence, npt_event_arm_token_fd). The runtime attaches it and closes its
+ * own copy; the bridge waits on it before showing the frame. */
+#define SVR_NPT_FENCE_MAGIC 0xA6u
+#define SVR_NPT_IS_FENCE(h) ((uint32_t)((uint64_t)(h) >> 56) == SVR_NPT_FENCE_MAGIC)
+#define SVR_NPT_NO_SLOT 0xffffffffu
+struct svr_npt_submit_req {
+  struct svr_hdr h;
+  struct svr_wmtvr_submit info; /* eye[].texture as returned by Neptune; slice selects the stacked slice */
+  struct svr_npt_eye npt[2];
+  uint32_t fence_slot; /* attached fd of the copy's fence, or SVR_NPT_NO_SLOT (the copy is done already) */
+  uint32_t pad;
 };
 
 #endif

@@ -10,6 +10,7 @@
 
 #include "openvr.h"
 #include "steamac_vr_guest.h"
+#include "vrmath.h"
 #include "transport.h"
 
 namespace svr {
@@ -99,12 +100,21 @@ class Runtime {
   uint32_t stats_head_invalid_ = 0;
   svr_wmtvr_submit pending_{};
   bool pending_eye_[2] = {};
+  svr_npt_eye pending_npt_[2] = {};  // shape of Neptune eye images (SVR_NPT_IS_HANDLE textures)
   // diagnostics: the last logged submit geometry per eye and head pose flags (logged when they change)
   struct SubmitGeometry {
     uint32_t width, height, format, array_size, slice, x, y, w, h, flags;
   };
   SubmitGeometry logged_geometry_[2] = {};
   uint32_t logged_head_flags_ = ~0u;
+  // STEAMAC_VR_RECENTER=1: the game's stage space is the host's moved so that where the head first was (on the
+  // floor) is the origin and its yaw then is forward. Games that place things around the stage origin (Half-Life:
+  // Alyx's menu) then put them in front of the player. Poses sent back for reprojection are host space again.
+  bool recenter_wanted_ = false, recentered_ = false;
+  Quat recenter_q_{};          // host -> game rotation (a yaw)
+  float recenter_c_[3] = {};   // host position that becomes the origin
+  void recenter_locked(svr_frame_rep &rep);
+  void to_host_locked(float pose[7]) const;
   bool pending_valid_ = false;
   std::deque<vr::VREvent_t> events_;
   bool connected_[kDeviceCount] = {};

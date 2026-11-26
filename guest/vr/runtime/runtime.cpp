@@ -2,6 +2,7 @@
 #include "runtime.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <utility>
 
 #include "log.h"
+#include "vulkan_bridge.h"
 #include "vrmath.h"
 
 namespace svr {
@@ -41,6 +43,7 @@ vr::EVRInitError Runtime::init(vr::EVRApplicationType type) {
   std::lock_guard<std::mutex> g(m_);
   if (transport_) return vr::VRInitError_None;
   transport_ = Transport::open_default();
+  if (const char *e = getenv("STEAMAC_VR_RECENTER"); e && *e == '1') recenter_wanted_ = true;
   if (!transport_) {
     SVR_ERR("no host link (DXMT/wmtr not loaded in this process and STEAMAC_VR_SOCKET not set)");
     return vr::VRInitError_Init_HmdNotFound;
@@ -107,6 +110,10 @@ bool Runtime::fetch(svr_frame_rep *out) {
   if (r || rep.h.op != SVR_FRAME || rep.h.size != sizeof(rep)) {
     SVR_ERR("frame request failed (%d)", r);
     return false;
+  }
+  if (recenter_wanted_) {
+    std::lock_guard<std::mutex> g(m_);
+    recenter_locked(rep);
   }
   if (rep.connected && need_view) {
     // VR_Init ran before a headset connected: its hello had no eye size, FOV or IPD (GetProjectionRaw would be all
@@ -283,11 +290,26 @@ vr::EVRCompositorError Runtime::submit(vr::EVREye eye, const vr::Texture_t *tex,
                                        vr::EVRSubmitFlags flags, uint32_t array_index) {
   if (eye != vr::Eye_Left && eye != vr::Eye_Right) return vr::VRCompositorError_IndexOutOfRange;
   if (!tex || !tex->handle) return vr::VRCompositorError_InvalidTexture;
-  if (tex->eType != vr::TextureType_Metal) {
-    SVR_ERR("unsupported texture type %d (only DXMT textures via TextureType_Metal)", (int)tex->eType);
+  const svr_metal_texture *mt;
+  vr::VRTextureBounds_t vulkan_bounds;
+  if (tex->eType == vr::TextureType_Vulkan) {
+    // a native Vulkan game: copied into a Metal texture the host can show (vulkan_bridge.cpp)
+    uint32_t rw = 0, rh = 0;
+    mt = vulkan_bridge_convert(eye == vr::Eye_Left ? 0 : 1, tex, flags & vr::Submit_VulkanTextureWithArrayData, bounds,
+                               &rw, &rh);
+    if (!mt) return vr::VRCompositorError_InvalidTexture;
+    // the bridge copied the bounds' region to the top-left of its texture: the game's bounds become that rect,
+    // flipped the same way
+    bool flipped = bounds && bounds->vMin > bounds->vMax;
+    float fu = (float)rw / mt->width, fv = (float)rh / mt->height;
+    vulkan_bounds = vr::VRTextureBounds_t{0, flipped ? fv : 0, fu, flipped ? 0 : fv};
+    bounds = &vulkan_bounds;
+  } else if (tex->eType == vr::TextureType_Metal) {
+    mt = (const svr_metal_texture *)tex->handle;
+  } else {
+    SVR_ERR("unsupported texture type %d (DXMT textures via TextureType_Metal, or Vulkan)", (int)tex->eType);
     return vr::VRCompositorError_TextureUsesUnsupportedFormat;
   }
-  auto *mt = (const svr_metal_texture *)tex->handle;
   if (mt->magic != SVR_METAL_TEXTURE_MAGIC || mt->size < sizeof(*mt) || !mt->handle || !mt->width || !mt->height) {
     SVR_ERR("TextureType_Metal handle is not a steamac DXMT texture description");
     return vr::VRCompositorError_InvalidTexture;
@@ -314,6 +336,7 @@ vr::EVRCompositorError Runtime::submit(vr::EVREye eye, const vr::Texture_t *tex,
       memcpy(pending_.pose[e], head.orientation, 4 * sizeof(float));
       for (int i = 0; i < 3; i++) pending_.pose[e][4 + i] = head.position[i] + w[i];
       memcpy(pending_.fov[e], hello_.fov[e], sizeof(pending_.fov[e]));
+      to_host_locked(pending_.pose[e]);
     }
     pending_valid_ = true;
   }
@@ -342,6 +365,12 @@ vr::EVRCompositorError Runtime::submit(vr::EVREye eye, const vr::Texture_t *tex,
              bounds ? bounds->vMax : 1.f, e.x, e.y, e.w ? e.w : mt->width, e.w ? e.h : mt->height,
              e.w ? "" : " (whole)", (unsigned)flags, flip ? ", bottom-up" : "", (e.flags & SVR_EYE_SRGB) ? ", sRGB" : "");
   }
+  if (SVR_NPT_IS_HANDLE(mt->handle)) {
+    svr_npt_eye &n = pending_npt_[eye];
+    n.width = mt->width, n.height = mt->height, n.dxgi_format = mt->dxgi_format;
+    n.slices = mt->array_size ? mt->array_size : 1;
+    n.pitch = SVR_NPT_HANDLE_PITCH(mt->handle);
+  }
   if (mt->event_handle && mt->event_value >= pending_.wait_value) {
     pending_.wait_event = mt->event_handle;
     pending_.wait_value = mt->event_value;
@@ -351,13 +380,55 @@ vr::EVRCompositorError Runtime::submit(vr::EVREye eye, const vr::Texture_t *tex,
   return vr::VRCompositorError_None;
 }
 
+void Runtime::recenter_locked(svr_frame_rep &rep) {
+  const svr_pose &head = rep.pose[SVR_DEV_HEAD];
+  if (!recentered_) {
+    if (!rep.connected || (head.flags & (SVR_POSE_VALID | SVR_POSE_TRACKED)) != (SVR_POSE_VALID | SVR_POSE_TRACKED))
+      return;
+    Quat q{head.orientation[0], head.orientation[1], head.orientation[2], head.orientation[3]};
+    const float fwd[3] = {0, 0, -1};
+    float f[3];
+    qrot(q, fwd, f);
+    float yaw = std::atan2(-f[0], -f[2]);  // rotation about +y that takes -z to the head's horizontal forward
+    recenter_q_ = Quat{0, std::sin(-yaw / 2), 0, std::cos(-yaw / 2)};
+    recenter_c_[0] = head.position[0], recenter_c_[1] = 0, recenter_c_[2] = head.position[2];
+    recentered_ = true;
+    SVR_INFO("recentered: origin at host %.2f, %.2f m, yaw %.0f degrees", recenter_c_[0], recenter_c_[2],
+             yaw * 57.29578f);
+  }
+  for (svr_pose &p : rep.pose) {
+    float d[3] = {p.position[0] - recenter_c_[0], p.position[1], p.position[2] - recenter_c_[2]}, v[3];
+    qrot(recenter_q_, d, p.position);
+    Quat o = qmul(recenter_q_, Quat{p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]});
+    p.orientation[0] = o.x, p.orientation[1] = o.y, p.orientation[2] = o.z, p.orientation[3] = o.w;
+    memcpy(v, p.lin_vel, sizeof v);
+    qrot(recenter_q_, v, p.lin_vel);
+    memcpy(v, p.ang_vel, sizeof v);
+    qrot(recenter_q_, v, p.ang_vel);
+  }
+}
+
+void Runtime::to_host_locked(float pose[7]) const {
+  if (!recentered_) return;
+  Quat inv{-recenter_q_.x, -recenter_q_.y, -recenter_q_.z, recenter_q_.w};
+  Quat o = qmul(inv, Quat{pose[0], pose[1], pose[2], pose[3]});
+  pose[0] = o.x, pose[1] = o.y, pose[2] = o.z, pose[3] = o.w;
+  float p[3];
+  qrot(inv, pose + 4, p);
+  pose[4] = p[0] + recenter_c_[0], pose[5] = p[1] + recenter_c_[1], pose[6] = p[2] + recenter_c_[2];
+}
+
 void Runtime::flush_submit_locked() {
   pending_valid_ = false;
   if (!pending_eye_[0] || !pending_eye_[1]) {
     SVR_TRACE("frame %llu dropped: only one eye submitted", (unsigned long long)pending_.frame_id);
     return;
   }
-  int r = transport_ ? transport_->submit(pending_) : -ENOTCONN;
+  int r;
+  if (!transport_) r = -ENOTCONN;
+  else if (SVR_NPT_IS_HANDLE(pending_.eye[0].texture) && SVR_NPT_IS_HANDLE(pending_.eye[1].texture))
+    r = transport_->submit_npt(pending_, pending_npt_);
+  else r = transport_->submit(pending_);
   if (r) SVR_ERR("submit of frame %llu failed (%d)", (unsigned long long)pending_.frame_id, r);
   else frames_presented_++;
 }

@@ -19,7 +19,7 @@ RUNTIME_LDFLAGS ?= -static-libstdc++ -static-libgcc
 
 RUNTIME_SRC = runtime/clientcore.cpp runtime/system.cpp runtime/compositor.cpp runtime/input.cpp \
               runtime/input_bindings.cpp runtime/misc.cpp runtime/runtime.cpp runtime/transport.cpp \
-              runtime/json.cpp runtime/log.cpp runtime/overlay.cpp runtime/skeleton.cpp
+              runtime/json.cpp runtime/log.cpp runtime/overlay.cpp runtime/skeleton.cpp runtime/vulkan_bridge.cpp
 HDRS = $(wildcard include/*.h runtime/*.h)
 
 all: $(OUT)/runtime/bin/linux64/vrclient.so $(OUT)/vr-fakehost $(OUT)/vr-testapp $(OUT)/unit_tests $(OUT)/transport_test
