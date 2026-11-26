@@ -121,13 +121,14 @@ add_library(vrhost-core STATIC
 	src/vd/vd_streamer_key.cpp
 	src/vd/vd_wire.cpp
 	src/encoder/vt_encoder.mm
+	src/oxrsys/oxrsys_session.mm
 	src/pattern/test_pattern.mm)
 target_include_directories(vrhost-core PUBLIC src include)
 target_link_libraries(vrhost-core PUBLIC wivrn-common wivrn-pacer vd-lz4
 	"-framework CoreFoundation" "-framework CoreMedia" "-framework CoreVideo" "-framework VideoToolbox"
 	"-framework IOSurface" "-framework Metal" "-framework Foundation")
 target_compile_options(vrhost-core PRIVATE -Wall -Wextra -Wno-unused-parameter)
-set_source_files_properties(src/encoder/vt_encoder.mm src/pattern/test_pattern.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+set_source_files_properties(src/encoder/vt_encoder.mm src/oxrsys/oxrsys_session.mm src/pattern/test_pattern.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
 
 # --- game frames (M1 compositor + VR link) and the pipeline into the session ---
 include(compositor.cmake)

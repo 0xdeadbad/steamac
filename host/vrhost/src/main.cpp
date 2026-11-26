@@ -9,7 +9,8 @@
 //   --list-headsets [--json] / --unpair NAME / --unpair-all   manage paired headsets
 //   --control-socket PATH  status/pairing requests from the launcher (docs/vr-interfaces.md section 5)
 //   --audio-fd N           game audio / headset microphone via the VR audio region (docs/vr-interfaces.md section 6)
-//   --adapter wivrn|vd     headset protocol: WiVRn (default) or Virtual Desktop (unofficial)
+//   --adapter wivrn|vd|oxrsys  headset protocol: WiVRn (default), Virtual Desktop (unofficial), or a host OpenXR
+//                          runtime such as OXRSys (prototype). <known_keys dir>/adapter holding "oxrsys" selects it too.
 #include "audio/audio_bridge.h"
 #include "control/control_server.h"
 #include "encoder/vt_encoder.h"
@@ -17,6 +18,7 @@
 #include "pipeline/vr_pipeline.h"
 #include "session/clock.h"
 #include "session/session_control.h"
+#include "oxrsys/oxrsys_session.h"
 #include "vd/vd_session.h"
 #include "vd/vd_streamer_key.h"
 #include "wivrn/annexb.h"
@@ -90,7 +92,7 @@ static void usage()
 	        "  --bitrate BPS       total bitrate (default 50000000)\n"
 	        "  self-test tuning:   --layout eyes|serial|sbs  --prioritize-speed  --max-frame-delay N  --qp N\n"
 	        "                      --no-low-latency-rc  --csv (one summary line)\n"
-	        "  --adapter wivrn|vd  headset protocol (default wivrn)\n"
+	        "  --adapter wivrn|vd|oxrsys  headset protocol (default wivrn; oxrsys = host OpenXR runtime, prototype)\n"
 	        "  Virtual Desktop (--adapter vd; --size, --bitrate (max 200000000), --pair apply):\n"
 	        "  (the discovery key is read at start from the user's own installed Virtual Desktop Streamer, kept in\n"
 	        "   memory only, never stored or logged)\n"
@@ -447,6 +449,23 @@ static Adapter make_vd(const VdOptions & o, uint32_t w, uint32_t h, uint32_t bit
 	return a;
 }
 
+// Host OpenXR runtime (OXRSys): the runtime encodes and streams, this process is its OpenXR application.
+static Adapter make_oxrsys()
+{
+	auto session = std::make_unique<OxrsysSession>(OxrsysConfig{.log = log_line});
+	OxrsysSession & s = *session;
+	Adapter a;
+	a.control = std::make_unique<OxrsysControl>(s);
+	a.announce = [&s] { printf("OpenXR adapter: waiting for the host runtime (%s)\n", s.runtime_name().empty() ? "loading" : s.runtime_name().c_str()); };
+	a.report = [&s] {
+		auto & st = s.stats();
+		printf("oxrsys %s: frames submitted %" PRIu64 " skipped %" PRIu64 " inputs %" PRIu64 ", last submit %.2f ms\n", s.state_name().c_str(),
+		       st.frames_submitted.load(), st.frames_skipped.load(), st.inputs.load(), st.last_submit_ns.load() / 1e6);
+	};
+	a.session = std::move(session);
+	return a;
+}
+
 static int testpattern(Adapter & adapter)
 {
 	VrSession & session = *adapter.session;
@@ -754,7 +773,7 @@ int main(int argc, char ** argv)
 		else if (a == "--adapter")
 		{
 			adapter_name = next();
-			if (adapter_name != "wivrn" and adapter_name != "vd")
+			if (adapter_name != "wivrn" and adapter_name != "vd" and adapter_name != "oxrsys")
 			{
 				usage();
 				return 2;
@@ -886,7 +905,15 @@ int main(int argc, char ** argv)
 				if (mode == link and not accept_link(link_fd, link_socket))
 					return 0;
 				{
-					Adapter adapter = adapter_name == "vd" ? make_vd(vd_opts, w, h, bitrate_given ? cfg.bitrate_bps : VdConfig{}.bitrate_bps, pair,
+					if (adapter_name == "wivrn")
+					{
+						// Prototype switch for launcher-started hosts: <known_keys dir>/adapter = "oxrsys".
+						std::ifstream f(KnownKeys::default_dir() / "adapter");
+						std::string want;
+						if (f >> want and want == "oxrsys")
+							adapter_name = want;
+					}
+					Adapter adapter = adapter_name == "oxrsys" ? make_oxrsys() : adapter_name == "vd" ? make_vd(vd_opts, w, h, bitrate_given ? cfg.bitrate_bps : VdConfig{}.bitrate_bps, pair,
 					                                               cfg.applications)
 					                                       : make_wivrn(cfg, mode == link);
 					return mode == link ? serve_link(adapter, link_fd, mach_name, g_audio_fd) : testpattern(adapter);
